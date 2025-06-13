@@ -1,17 +1,29 @@
 import { SafeAreaView } from 'react-native-safe-area-context';
-import React, { useEffect, useReducer, useState, useRef } from 'react';
-import { View, StyleSheet, Text, Alert, TouchableOpacity, Dimensions } from 'react-native';
+import React, { useEffect, useReducer, useState, useRef, useCallback, useMemo } from 'react';
+import { View, StyleSheet, Text, Alert, TouchableOpacity, Dimensions, AppState, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import { io, Socket } from 'socket.io-client';
 import MapView, { Marker, Region, Polyline, PROVIDER_DEFAULT } from 'react-native-maps';
 import { Image } from 'react-native';
+import { debounce } from 'lodash';
 
 const { width, height } = Dimensions.get('window');
 const ASPECT_RATIO = width / height;
 const LATITUDE_DELTA = 0.04;
 const LONGITUDE_DELTA = LATITUDE_DELTA * ASPECT_RATIO;
+interface ConnectedPayload {
+  deliveryCoords: Coords;
+  customerCoords: Coords;
+  routeCoords: RouteCoord[];
+  eta: string | null;
+  orderStatus: string;
+}
 
+interface OrderStatusUpdate {
+  status: string;
+  eta: string | null;
+}
 interface Coords {
   latitude: number;
   longitude: number;
@@ -35,6 +47,7 @@ interface State {
 }
 
 type Action =
+    { type:'BATCH_UPDATE';payload: Partial<State>}
   | { type: 'SET_DELIVERY_COORDS'; payload: Coords }
   | { type: 'SET_CUSTOMER_COORDS'; payload: Coords }
   | { type: 'SET_ORDER_STATUS'; payload: string }
@@ -55,6 +68,8 @@ const initialState: State = {
 
 const reducer = (state: State, action: Action): State => {
   switch (action.type) {
+    case 'BATCH_UPDATE':
+      return {...state,...action.payload,lastLocationUpdate:Date.now()}
     case 'SET_DELIVERY_COORDS':
       return { ...state, deliveryCoords: action.payload, lastLocationUpdate: Date.now() };
     case 'SET_CUSTOMER_COORDS':
@@ -74,7 +89,7 @@ const reducer = (state: State, action: Action): State => {
   }
 };
 
-const SOCKET_URL = 'http://iitr.sainsg.tech';
+const SOCKET_URL = 'http://192.168.31.20:8085';
 
 const DEFAULT_REGION: Region = {
   latitude: 12.9716,
@@ -82,7 +97,6 @@ const DEFAULT_REGION: Region = {
   latitudeDelta: 0.02,
   longitudeDelta: 0.02,
 };
-
 export default function CustomerApp() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const DELIVERY_ICON = require('../assets/images/delivery-icon-png.png');
@@ -93,8 +107,6 @@ export default function CustomerApp() {
   const mapRef = useRef<MapView | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const locationUpdateInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Check for stale location updates
   useEffect(() => {
     const checkLocationFreshness = () => {
       const timeSinceLastUpdate = Date.now() - lastLocationUpdate;
@@ -106,109 +118,204 @@ export default function CustomerApp() {
   }, [lastLocationUpdate]);
 
   // Request location updates from delivery person
-  useEffect(() => {
-    if (isConnected && socketRef.current) {
-      // Request immediate update
+// Replace NodeJS.Timeout with number for React Native
+useEffect(() => {
+  if (!isConnected || !socketRef.current) return;
+
+  var timeoutId: number;
+  let intervalId: number;
+
+  const requestUpdate = () => {
+    if (socketRef.current && socketConnected) {
       socketRef.current.emit('requestLocationUpdate');
-      
-      // Set up periodic requests
-      locationUpdateInterval.current = setInterval(() => {
-        if (socketRef.current && socketConnected) {
-          socketRef.current.emit('requestLocationUpdate');
-        }
-      }, 10000); // Request every 10 seconds
-
-      return () => {
-        if (locationUpdateInterval.current) {
-          clearInterval(locationUpdateInterval.current);
-        }
-      };
     }
-  }, [isConnected, socketConnected]);
+  };
 
-  // Initialize socket connection
-  useEffect(() => {
-    const socket = io(SOCKET_URL, {
-      autoConnect: true,
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
+  requestUpdate();
+  
+  const updateInterval = AppState.currentState === 'active' ? 10000 : 30000;
+  intervalId = setInterval(requestUpdate, updateInterval) as number;
+
+  return () => {
+    clearTimeout(timeoutId);
+    clearInterval(intervalId);
+  };
+}, [isConnected, socketConnected]);
+
+// Add AppState listener
+useEffect(() => {
+  const handleAppStateChange = (nextAppState: string) => {
+    if (nextAppState === 'background' && socketRef.current) {
+      socketRef.current.emit('pauseTracking');
+    } else if (nextAppState === 'active' && socketRef.current) {
+      socketRef.current.emit('resumeTracking');
+    }
+  };
+
+  const subscription = AppState.addEventListener('change', handleAppStateChange);
+  return () => subscription?.remove();
+}, []);
+// Change from useMemo to useCallback since it's a function
+const getTimeSinceLastUpdate = useCallback((): string => {
+  const minutes = Math.floor((Date.now() - lastLocationUpdate) / 60000);
+  if (minutes < 1) return 'Just now';
+  if (minutes === 1) return '1 minute ago';
+  return `${minutes} minutes ago`;
+}, [lastLocationUpdate]);
+
+
+
+// Debounce expensive operations
+const mapCoordinates = useMemo(() => {
+  if (!deliveryCoords || !customerCoords) return [];
+  return [
+    { latitude: deliveryCoords.latitude, longitude: deliveryCoords.longitude },
+    { latitude: customerCoords.latitude, longitude: customerCoords.longitude },
+    ...routeCoords
+  ];
+}, [deliveryCoords, customerCoords, routeCoords]);
+const debouncedMapFit = useMemo(
+  () => debounce(() => {
+    if (mapRef.current && mapCoordinates.length >= 2) {
+      mapRef.current.fitToCoordinates(mapCoordinates, {
+        edgePadding: { top: 100, right: 50, bottom: 350, left: 50 },
+        animated: true,
+      });
+    }
+  }, 500),
+  [mapCoordinates]
+);
+const getCurrentLocation = useCallback(async () => {
+  try {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Error', 'Location permission denied');
+      return;
+    }
+
+    // Use correct Expo Location options
+    const locationPromise = Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.High,
+      // Remove maximumAge - not supported in Expo Location
     });
 
-    socketRef.current = socket;
-
-    socket.on('connect', () => {
-      console.log('Connected to server:', socket.id);
-      setSocketConnected(true);
+    // Implement manual timeout
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Location timeout')), 15000);
     });
 
-    socket.on('disconnect', () => {
-      console.log('Disconnected from server');
-      setSocketConnected(false);
-      dispatch({ type: 'SET_CONNECTED', payload: false });
-    });
+    const location = await Promise.race([locationPromise, timeoutPromise]) as Location.LocationObject;
 
-    socket.on('joinedAsCustomer', () => {
-      console.log('Successfully joined as customer');
-      getCurrentLocation();
-    });
-
-    socket.on('deliveryLocation', (coords: Coords) => {
-      console.log('Delivery location received:', coords);
-      dispatch({ type: 'SET_DELIVERY_COORDS', payload: coords });
-    });
-
-    socket.on('connected', ({ deliveryCoords, customerCoords, routeCoords, eta, orderStatus }) => {
-      console.log('Connected to delivery person successfully');
-      dispatch({ type: 'SET_DELIVERY_COORDS', payload: deliveryCoords });
-      dispatch({ type: 'SET_CUSTOMER_COORDS', payload: customerCoords });
-      dispatch({ type: 'SET_ROUTE', payload: routeCoords });
-      dispatch({ type: 'SET_ORDER_STATUS', payload: orderStatus });
-      dispatch({ type: 'SET_CONNECTED', payload: true });
-
-      Alert.alert('Success', 'Connected to delivery person! You can track your order now.');
-    });
-
-    socket.on('orderStatusUpdate', ({ status, eta }) => {
-      dispatch({ type: 'SET_ORDER_STATUS', payload: status });
-      dispatch({ type: 'SET_ETA', payload: eta });
-      
-      if (status === 'Picked Up') {
-        Alert.alert('Order Update', 'Your order has been picked up!');
-      } else if (status === 'Delivered') {
-        Alert.alert('Order Delivered', 'Your order has been delivered! Thank you!');
-      }
-    });
-
-    socket.on('error', ({ message }) => {
-      Alert.alert('Error', message);
-    });
-
-    return () => {
-      socket.disconnect();
-      if (locationUpdateInterval.current) {
-        clearInterval(locationUpdateInterval.current);
-      }
+    const coords: Coords = {
+      // latitude: location.coords.latitude,
+      // longitude: location.coords.longitude,
+              // latitude: 17.359623,
+      latitude:40.68125,
+        // longitude: 78.473765,
+        longitude:-74.19409,
+      latitudeDelta: LATITUDE_DELTA,
+      longitudeDelta: LONGITUDE_DELTA,
     };
-  }, []);
 
-  // Auto-fit map to show both endpoints
-  useEffect(() => {
-    if (mapRef.current && deliveryCoords && customerCoords && mapViewMode === 'overview') {
-      const coordinates = [
-        { latitude: deliveryCoords.latitude, longitude: deliveryCoords.longitude },
-        { latitude: customerCoords.latitude, longitude: customerCoords.longitude },
-        ...routeCoords
-      ];
-      
-      setTimeout(() => {
-        mapRef.current?.fitToCoordinates(coordinates, {
-          edgePadding: { top: 100, right: 50, bottom: 350, left: 50 },
-          animated: true,
-        });
-      }, 500);
+    dispatch({ type: 'SET_CUSTOMER_COORDS', payload: coords });
+    
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('customerLocation', { 
+        customerCoords:{        
+        // latitude: 17.359623,
+      latitude:40.68125,
+        // longitude: 78.473765,
+        longitude:-74.19409,
+        latitudeDelta: LATITUDE_DELTA,
+        longitudeDelta: LONGITUDE_DELTA,}  });
     }
-  }, [deliveryCoords, customerCoords, routeCoords, mapViewMode]);
+  } catch (error) {
+    console.error('Location error:', error);
+    // Fallback to default location
+    const fallbackCoords: Coords = {
+      latitude: 17.587686,
+      longitude: 78.401865,
+      latitudeDelta: LATITUDE_DELTA,
+      longitudeDelta: LONGITUDE_DELTA,
+    };
+    dispatch({ type: 'SET_CUSTOMER_COORDS', payload: fallbackCoords });
+  }
+}, []);
+  // Initialize socket connection
+useEffect(() => {
+  const socket = io(SOCKET_URL, {
+    autoConnect: true,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 2000,
+    reconnectionDelayMax: 10000,
+    randomizationFactor: 0.5,
+    timeout: 20000,
+    forceNew: false,
+    upgrade: true,
+    rememberUpgrade: true,
+  });
+
+  socketRef.current = socket;
+
+  // Batch socket event handlers
+  const handleConnect = () => {
+    console.log('Connected to server:', socket.id);
+    setSocketConnected(true);
+  };
+
+  const handleDisconnect = () => {
+    console.log('Disconnected from server');
+    setSocketConnected(false);
+    dispatch({ type: 'SET_CONNECTED', payload: false });
+  };
+
+  const handleDeliveryLocation = (coords: Coords) => {
+    dispatch({ type: 'SET_DELIVERY_COORDS', payload: coords });
+  };
+
+  const handleConnected = ({ deliveryCoords, customerCoords, routeCoords, eta, orderStatus }:ConnectedPayload) => {
+    // Batch dispatch
+    dispatch({ type: 'SET_DELIVERY_COORDS', payload: deliveryCoords });
+    dispatch({ type: 'SET_CUSTOMER_COORDS', payload: customerCoords });
+    dispatch({ type: 'SET_ROUTE', payload: routeCoords });
+    dispatch({ type: 'SET_ORDER_STATUS', payload: orderStatus });
+    dispatch({ type: 'SET_CONNECTED', payload: true });
+  };
+
+  socket.on('connect', handleConnect);
+  socket.on('disconnect', handleDisconnect);
+  socket.on('joinedAsCustomer', getCurrentLocation);
+  socket.on('deliveryLocation', handleDeliveryLocation);
+  socket.on('connected', handleConnected);
+  socket.on('orderStatusUpdate', ({ status, eta }) => {
+    dispatch({ type: 'SET_ORDER_STATUS', payload: status });
+    dispatch({ type: 'SET_ETA', payload: eta });
+  });
+
+  return () => {
+    socket.off('connect', handleConnect);
+    socket.off('disconnect', handleDisconnect);
+    socket.off('joinedAsCustomer', getCurrentLocation);
+    socket.off('deliveryLocation', handleDeliveryLocation);
+    socket.off('connected', handleConnected);
+    socket.disconnect();
+  };
+}, [getCurrentLocation]);
+  // Auto-fit map to show both endpoints
+// Optimize map auto-fit effect
+useEffect(() => {
+  if (mapRef.current && mapCoordinates.length >= 2 && mapViewMode === 'overview') {
+    const timeoutId = setTimeout(() => {
+      mapRef.current?.fitToCoordinates(mapCoordinates, {
+        edgePadding: { top: 100, right: 50, bottom: 350, left: 50 },
+        animated: true,
+      });
+    }, 300); // Reduced timeout
+
+    return () => clearTimeout(timeoutId);
+  }
+}, [mapCoordinates, mapViewMode]);
 
   // Setup notifications
   useEffect(() => {
@@ -232,38 +339,9 @@ export default function CustomerApp() {
     return () => subscription.remove();
   }, []);
 
-  const getCurrentLocation = async () => {
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Error', 'Location permission denied');
-        return;
-      }
 
-      const location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
-      });
 
-      const coords: Coords = {
-        latitude: 17.587686,
-        longitude: 78.401865,
-        latitudeDelta: LATITUDE_DELTA,
-        longitudeDelta: LONGITUDE_DELTA,
-      };
-
-      dispatch({ type: 'SET_CUSTOMER_COORDS', payload: coords });
-      
-      if (socketRef.current) {
-        socketRef.current.emit('customerLocation', { customerCoords: coords });
-      }
-
-      console.log('Customer location sent:', coords);
-    } catch (error) {
-      Alert.alert('Error', `Failed to get location: ${(error as Error).message}`);
-    }
-  };
-
-  const handleJoinAsCustomer = () => {
+  const handleJoinAsCustomer =() => {
     if (socketRef.current && socketConnected) {
       socketRef.current.emit('joinAsCustomer');
       dispatch({ type: 'SET_ORDER_STATUS', payload: 'Waiting for Delivery Person...' });
@@ -272,7 +350,7 @@ export default function CustomerApp() {
     }
   };
 
-  const handleMapViewChange = (mode: 'overview' | 'delivery' | 'customer') => {
+  const handleMapViewChange = useCallback((mode: 'overview' | 'delivery' | 'customer') => {
     setMapViewMode(mode);
     
     if (mode === 'delivery' && deliveryCoords) {
@@ -301,7 +379,7 @@ export default function CustomerApp() {
         animated: true,
       });
     }
-  };
+  },[deliveryCoords,customerCoords,routeCoords]);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -315,14 +393,43 @@ export default function CustomerApp() {
         return '#666';
     }
   };
-
-  const getTimeSinceLastUpdate = () => {
-    const minutes = Math.floor((Date.now() - lastLocationUpdate) / 60000);
-    if (minutes < 1) return 'Just now';
-    if (minutes === 1) return '1 minute ago';
-    return `${minutes} minutes ago`;
+  // Fix AppState listener for proper typing
+useEffect(() => {
+  const handleAppStateChange = (nextAppState: string) => {
+    if (nextAppState === 'background' && socketRef.current) {
+      socketRef.current.emit('pauseTracking');
+    } else if (nextAppState === 'active' && socketRef.current) {
+      socketRef.current.emit('resumeTracking');
+    }
   };
 
+  let subscription: any;
+  if (Platform.OS === 'ios') {
+    subscription = AppState.addEventListener('change', handleAppStateChange);
+  } else {
+    subscription = AppState.addEventListener('change', handleAppStateChange);
+  }
+  
+  return () => {
+    if (subscription) {
+      subscription.remove();
+    }
+  };
+}, []);
+
+useEffect(() => {
+  return () => {
+    // Clear all timeouts and intervals
+    if (locationUpdateInterval.current) {
+      clearInterval(locationUpdateInterval.current);
+    }
+    // Disconnect socket properly
+    if (socketRef.current) {
+      socketRef.current.removeAllListeners();
+      socketRef.current.disconnect();
+    }
+  };
+}, []);
   return (
     <SafeAreaView style={styles.container}>
       {isConnected ? (
@@ -411,12 +518,12 @@ export default function CustomerApp() {
                 <Text style={styles.statusText}>{orderStatus}</Text>
               </View>
               
-              {isLocationStale && (
+              {/* {isLocationStale && (
                 <View style={styles.connectionStatus}>
                   <View style={styles.warningDot} />
                   <Text style={styles.connectionText}>Connection Issue</Text>
                 </View>
-              )}
+              )} */}
             </View>
 
             {eta && orderStatus !== 'Delivered' && (
